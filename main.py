@@ -10,14 +10,16 @@ import time
 import queue
 import tkinter as tk
 from tkinter import ttk, Scale, Entry
-import pyautogui
 from PIL import Image, ImageDraw
-import pystray
-import sys
 import json
+import os
+import shutil
+import subprocess
+import glob
 
 #consts
 SCRIPT_DIR = __file__.rsplit('/', 1)[0]
+SETTINGS_PATH = f"{SCRIPT_DIR}/settings.json"
 EYE_AR_THRESH = 0.25
 EYE_AR_CONSEC_FRAMES = 1
 DOUBLE_BLINK_INTERVAL = 0.6
@@ -26,11 +28,44 @@ TOTAL = 0
 DOUBLE_BLINK_COUNT = 0
 blink_times = []
 PLATID = 1 if sys.platform.startswith('win') else 0 #platform check
+IS_WAYLAND = os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+
+# Wayland compositors deliberately block the X11-style input injection used by
+# pyautogui. ydotool talks to a virtual uinput keyboard through ydotoold instead.
+pyautogui = None
+pystray = None
+if not IS_WAYLAND:
+    import pyautogui
+    import pystray
+
+KEY_CODES = {
+    "esc": 1, "escape": 1, "tab": 15, "enter": 28, "return": 28,
+    "ctrl": 29, "control": 29, "leftctrl": 29, "leftcontrol": 29,
+    "shift": 42, "leftshift": 42, "alt": 56, "leftalt": 56,
+    "space": 57, "capslock": 58,
+    "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64,
+    "f7": 65, "f8": 66, "f9": 67, "f10": 68, "f11": 87, "f12": 88,
+    "rightctrl": 97, "rightcontrol": 97, "rightalt": 100,
+    "home": 102, "up": 103, "pageup": 104, "left": 105, "right": 106,
+    "end": 107, "down": 108, "pagedown": 109, "insert": 110, "delete": 111,
+    "win": 125, "windows": 125, "super": 125, "meta": 125,
+}
+KEY_CODES.update({str(number): 1 + number for number in range(1, 10)})
+KEY_CODES["0"] = 11
+KEY_CODES.update({letter: code for letter, code in zip("qwertyuiop", range(16, 26))})
+KEY_CODES.update({letter: code for letter, code in zip("asdfghjkl", range(30, 39))})
+KEY_CODES.update({letter: code for letter, code in zip("zxcvbnm", range(44, 51))})
 
 
 #init face detectors
 detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(f"{SCRIPT_DIR}/shape_predictor_68_face_landmarks.dat")
+PREDICTOR_PATH = f"{SCRIPT_DIR}/shape_predictor_68_face_landmarks.dat"
+if not os.path.isfile(PREDICTOR_PATH):
+    raise RuntimeError(
+        "Das dlib-Landmark-Modell fehlt. Starte die App mit `bash run_app.sh`, "
+        "damit es automatisch heruntergeladen wird."
+    )
+predictor = dlib.shape_predictor(PREDICTOR_PATH)
 
 
 #frame res
@@ -67,23 +102,23 @@ frame_window_open = False
 def get_camera_list():
     if PLATID == 1:
         from pygrabber.dshow_graph import FilterGraph
-        from comtypes import stream
         graph = FilterGraph()
-        return graph.get_input_devices()
-    
-    else:      #everything else other than windows
-        import subprocess
-        result = subprocess.run(['v4l2-ctl', '--list-devices'], stdout=subprocess.PIPE)
-        output = result.stdout.decode().split('\n')
-        cameras = []
-        current_camera = None
-        for line in output:
-            if not line.startswith('\t'):
-                current_camera = line.strip()
-            elif current_camera:
-                cameras.append(current_camera)
-                current_camera = None
-                return cameras
+        return [(name, index) for index, name in enumerate(graph.get_input_devices())]
+
+    # Do not depend on v4l2-ctl: it is optional on Fedora and OpenCV can query
+    # V4L2 cameras directly.  Keep the actual device index with the label.
+    cameras = []
+    video_devices = sorted(
+        glob.glob("/dev/video[0-9]*"),
+        key=lambda path: int(path.rsplit("video", 1)[1]),
+    )
+    for device_path in video_devices:
+        index = int(device_path.rsplit("video", 1)[1])
+        test_capture = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        if test_capture.isOpened():
+            cameras.append((f"Camera {index}", index))
+        test_capture.release()
+    return cameras or [("Default camera", 0)]
 
 
 #capture frame
@@ -134,13 +169,61 @@ def eye_aspect_ratio(eye):
     ear = (A + B) / (2.0 * C)
     return ear
 
-def key_press(key_string):
-    keys = key_string.lower().split('+')
+def set_input_status(message):
+    print(message)
+    if "input_status_label" in globals():
+        input_status_label.config(text=message)
 
-    try: #directly use the keys as they are 
-        pyautogui.hotkey(*keys) 
-    except Exception as e: 
-        print(f"Error: {e}")
+
+def ydotool_key_sequence(key_string):
+    aliases = {"right arrow": "right", "left arrow": "left", "up arrow": "up", "down arrow": "down"}
+    keys = [aliases.get(key.strip().lower(), key.strip().lower()) for key in key_string.split("+")]
+    unknown_keys = [key for key in keys if key not in KEY_CODES]
+    if unknown_keys:
+        raise ValueError(f"Nicht unterstützte Taste für Wayland: {', '.join(unknown_keys)}")
+
+    pressed = [f"{KEY_CODES[key]}:1" for key in keys]
+    released = [f"{KEY_CODES[key]}:0" for key in reversed(keys)]
+    return pressed + released
+
+
+def ydotool_environment():
+    """Use the socket created by Fedora's system service when it is available."""
+    socket_paths = [
+        os.environ.get("YDOTOOL_SOCKET"),
+        f"/run/user/{os.getuid()}/.ydotool_socket",
+        "/run/ydotool/socket",
+        "/run/ydotoold/socket",
+        "/tmp/.ydotool_socket",
+    ]
+    socket_path = next((path for path in socket_paths if path and os.path.exists(path)), None)
+    if not socket_path:
+        return None
+    environment = os.environ.copy()
+    environment["YDOTOOL_SOCKET"] = socket_path
+    return environment
+
+
+def key_press(key_string):
+    try:
+        if IS_WAYLAND:
+            if not shutil.which("ydotool"):
+                set_input_status("Wayland: ydotool fehlt – siehe README.")
+                return
+            subprocess.run(
+                ["ydotool", "key", *ydotool_key_sequence(key_string)],
+                check=True, timeout=3, capture_output=True, text=True,
+                env=ydotool_environment(),
+            )
+            set_input_status("Wayland: Shortcut gesendet (ydotool).")
+        else:
+            pyautogui.hotkey(*key_string.lower().split('+'))
+            set_input_status("Shortcut gesendet (pyautogui).")
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or error.stdout.strip() or str(error)
+        set_input_status(f"ydotool fehlgeschlagen: {detail}")
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        set_input_status(f"Shortcut fehlgeschlagen: {error}")
 
 #why am i commenting alla this?
 def process_frame(frame, gray):
@@ -261,6 +344,7 @@ def update_consec_frames(val):
 def update_command():
     global command
     command = command_entry.get()
+    save_settings()
 
 #yeah its to help the blind
 def save_settings():
@@ -269,14 +353,14 @@ def save_settings():
         "EYE_AR_CONSEC_FRAMES": EYE_AR_CONSEC_FRAMES,
         "command": command_entry.get()
     }
-    with open("settings.json", "w") as f:
+    with open(SETTINGS_PATH, "w") as f:
         json.dump(settings, f)
 
 #dw blink people i got you covered by commenting everything
 def load_settings():
     global EYE_AR_THRESH, EYE_AR_CONSEC_FRAMES, command
     try:
-        with open("settings.json", "r") as f:
+        with open(SETTINGS_PATH, "r") as f:
             settings = json.load(f)
             EYE_AR_THRESH = settings.get("EYE_AR_THRESH", EYE_AR_THRESH)
             EYE_AR_CONSEC_FRAMES = settings.get("EYE_AR_CONSEC_FRAMES", EYE_AR_CONSEC_FRAMES)
@@ -363,15 +447,19 @@ command_entry.insert(0, command)
 command_button = ttk.Button(root, text="Set Command", command=update_command)
 command_button.grid(row=3, column=2, padx=10, pady=10)
 
+input_backend = "ydotool" if IS_WAYLAND else "pyautogui (X11)"
+input_status_label = ttk.Label(root, text=f"Tastatur-Backend: {input_backend}")
+input_status_label.grid(row=4, column=0, columnspan=3, padx=10, pady=(0, 8))
+
 #camera selection
 camera_label = ttk.Label(root, text="Select Camera:")
-camera_label.grid(row=4, column=0, padx=10, pady=10)
+camera_label.grid(row=5, column=0, padx=10, pady=10)
 
-camera_list = get_camera_list()
+camera_choices = get_camera_list()
 selected_camera = tk.StringVar()
 camera_dropdown = ttk.Combobox(root, textvariable=selected_camera)
-camera_dropdown['values'] = camera_list
-camera_dropdown.grid(row=4, column=1, padx=10, pady=10)
+camera_dropdown['values'] = [label for label, _ in camera_choices]
+camera_dropdown.grid(row=5, column=1, padx=10, pady=10)
 camera_dropdown.current(0)
 
 #yk what? i aint commenting anymore
@@ -380,7 +468,7 @@ def update_camera_selection(event):
     running = False
     capture_thread.join()
     running = True
-    camera_index = camera_list.index(selected_camera.get())
+    camera_index = camera_choices[camera_dropdown.current()][1]
     capture_thread = Thread(target=capture_frame, args=(camera_index,))
     capture_thread.daemon = True
     capture_thread.start()
@@ -390,7 +478,7 @@ camera_dropdown.bind("<<ComboboxSelected>>", update_camera_selection)
 #starts with default cam
 def start_default_camera():
     global capture_thread
-    default_camera_index = 0
+    default_camera_index = camera_choices[0][1]
     capture_thread = Thread(target=capture_frame, args=(default_camera_index,))
     capture_thread.daemon = True
     capture_thread.start()
@@ -398,8 +486,12 @@ def start_default_camera():
 #why am i commenting this
 start_default_camera()
 
-root.protocol("WM_DELETE_WINDOW", minimize_to_tray)
-root.bind("<Unmap>", lambda event: minimize_to_tray() if root.state() == 'iconic' else None)
+if IS_WAYLAND:
+    # pystray currently selects an X11 backend. KDE's Wayland tray cannot use it.
+    root.protocol("WM_DELETE_WINDOW", quit_app)
+else:
+    root.protocol("WM_DELETE_WINDOW", minimize_to_tray)
+    root.bind("<Unmap>", lambda event: minimize_to_tray() if root.state() == 'iconic' else None)
 
 root.mainloop()
 
